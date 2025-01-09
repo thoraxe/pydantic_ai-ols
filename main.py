@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import json
+import os
 import subprocess
 import sys
+import time
 
 from dataclasses import dataclass
 from devtools import pprint
@@ -14,32 +16,44 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.vertexai import VertexAIModel
 
+
+log_format = "%(log_color)s%(asctime)s [%(levelname)s] %(reset)s%(purple)s[%(name)s] %(reset)s%(blue)s%(message)s"
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter(log_format))
+
+#logfilename = f"{int(time.time())}.log"
+#filehandler = logging.FileHandler(filename=logfilename, mode="a")
+logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+logger = logging.getLogger(__name__)
+
+# only for the spans
+#file_logger = logging.getLogger(__name__)
+#file_logger.handlers=filehandler
+
+from opentelemetry.sdk.trace.export import ConsoleSpanExporter, ReadableSpan, SimpleSpanProcessor
 import logfire
 
-logfire.configure(send_to_logfire=False, console=logfire.ConsoleOptions(verbose=True))
+traces_endpoint = 'http://localhost:4318/v1/traces'
+os.environ['OTEL_EXPORTER_OTLP_TRACES_ENDPOINT'] = traces_endpoint
+
+logfire.configure(send_to_logfire=False, 
+                  console=logfire.ConsoleOptions(verbose=True, min_log_level="debug"))
+logfire.instrument_httpx(capture_all=True)
+
+def formatter(span: ReadableSpan):
+    the_span = span.to_json(indent=None) + '\n'
+    return the_span
+
+#logfire.configure(send_to_logfire=False, 
+#                  console=logfire.ConsoleOptions(verbose=True, min_log_level="debug"),
+#                  additional_span_processors=[SimpleSpanProcessor(ConsoleSpanExporter(formatter=formatter))])
 
 from dotenv import load_dotenv
 
 load_dotenv()  # take environment variables from .env.
 
 pre_path = "/home/thoraxe/bin/"
-
-log_format = "%(log_color)s%(asctime)s [%(levelname)s] %(reset)s%(purple)s[%(name)s] %(reset)s%(blue)s%(message)s"
-handler = colorlog.StreamHandler()
-handler.setFormatter(colorlog.ColoredFormatter(log_format))
-logging.basicConfig(level=logging.DEBUG, handlers=[handler])
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class CLIDependencies:
-    token: str
-
-
-class CLIResult(BaseModel):
-    output: str = Field(description="The output from the CLI command")
-
 
 agent_extras = """
 In general:
@@ -50,7 +64,7 @@ In general:
 * for example, if you found a problem in microservice A that is due to an error in microservice B, look at microservice B too and find the error in that.
 * if you cannot find the resource/application that the user referred to, assume they made a typo or included/excluded characters like - and.
 * in this case, try to find substrings or search for the correct spellings
-* if you are unable to investigate something properly because you do not have access to the right data, explicitly tell the user that you are missing an integration to access XYZ which you would need to investigate. you should specifically use the templated phrase "I don't have access to <details>. Please add a Holmes integration for <XYZ> so that I can investigate this."
+* if you are unable to investigate something properly because you do not have access to the right data, explicitly tell the user that you are missing an integration to access XYZ which you would need to investigate. you should specifically use the templated phrase "I don't have access to <details>."
 * always provide detailed information like exact resource names, versions, labels, etc
 * even if you found the root cause, keep investigating to find other possible root causes and to gather data for the answer like exact names
 * if a runbook url is present as well as tool that can fetch it, you MUST fetch the runbook before beginning your investigation.
@@ -222,25 +236,12 @@ async def get_pod_status(ctx: RunContext[str], namespace: str, pod: str) -> str:
         pod: the name of the pod to check
         namespace: the namespace where the pod exists
     """
-    cmd = [
-            pre_path + "oc",
-            "get",
-            "pod",
-            "-n",
-            namespace,
-            pod,
-            "-o",
-            "jsonpsth=\{.status\}",
-        ]
 
-    logger.debug(cmd)
-    output = subprocess.run(
-        cmd,
+    output = subprocess.run(f"{pre_path}oc get pod -n {namespace} {pod} -o jsonpath='{{.status}}' | yq -p json -o yaml",
+        shell=True,
         capture_output=True,
         timeout=2,
     )
-    logger.debug(output.stdout)
-    logger.debug(output.stderr)
     return output.stdout
 
 
@@ -248,7 +249,6 @@ async def get_pod_status(ctx: RunContext[str], namespace: str, pod: str) -> str:
 @retrieval_agent.system_prompt
 def add_extras() -> str:
     return agent_extras
-
 
 result = routing_agent.run_sync(sys.argv[1])
 print(result.data)

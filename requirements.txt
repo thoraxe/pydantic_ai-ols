@@ -1,0 +1,6 @@
+colorlog
+devtools
+logfire
+opentelemetry-instrumentation-httpx
+pydantic-ai
+python-dotenv

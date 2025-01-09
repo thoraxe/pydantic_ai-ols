@@ -1,2 +1,4 @@
 .env
 __pycache__
+otelcol-contrib
+tracedata.json
