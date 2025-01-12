@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.vertexai import VertexAIModel
 
+from shutil import which
 
 log_format = "%(log_color)s%(asctime)s [%(levelname)s] %(reset)s%(purple)s[%(name)s] %(reset)s%(blue)s%(message)s"
 handler = colorlog.StreamHandler()
@@ -52,8 +53,6 @@ from dotenv import load_dotenv
 
 load_dotenv()  # take environment variables from .env.
 
-pre_path = "/home/thoraxe/bin/"
-
 agent_extras = """
 In general:
 * come up with a plan for what you want to do and then execute the plan step by step
@@ -78,11 +77,14 @@ routing_agent = Agent(
     "openai:gpt-4o",
     name="routing_agent",
     system_prompt="""You are a Kubernetes and OpenShift assistant. You should
-    only answer questions related to OpenShift and Kubernetes. You have multiple
+    only answer questions related to OpenShift, Kubernetes, and metrics from Prometheus. You have multiple
     agents on your team.
     
     You can retrieve information from Kubernetes and OpenShift environments
     using the retrieval agent. 
+    
+    You can also get a PromQL query from the metrics agent, to answer any system-level questions, that cannot only be
+    answered by the retrieval agent or Kubernetes/OpenShift knowledge.
     
     You also have an agent that can answer general knowledge questions. 
     
@@ -124,6 +126,20 @@ async def retrieval_tool(ctx: RunContext[str], original_query: str) -> str:
     return r.data
 
 
+@routing_agent.tool
+async def metrics_tool(ctx: RunContext[str], original_query: str) -> str:
+    """A tool for generating PromQL queries for a running OpenShift cluster's Prometheus instance.
+    Use this tool to answer questions about system-level metrics or things that cannot be only answered by the retrieval agent.
+
+    Args:
+        original_query: the question to get an answer for
+    """
+
+    logger.debug(ctx)
+    r = await metrics_agent.run(original_query, usage=ctx.usage)
+
+    return r.data
+
 knowledge_agent = Agent(
     "openai:gpt-4o",
     name="knowledge_agent",
@@ -148,11 +164,44 @@ that scenario.
 """,
 )
 
+metrics_agent = Agent(
+    "openai:gpt-4o",
+    name="metrics_agent",
+    system_prompt="""You are a Prometheus assistant. You should
+only answer questions related to metrics stored in a cluster's Prometheus instance.
+You can use the tool get_existing_metrics to get a list of metrics available in the Prometheus TSDB. 
+
+Using those construct a PromQL query that will answer the question, in the same way an SRE would, assuming system knowledge.
+Ensure that,
+- The PromQL query is valid PromQL and will not cause errors and can actually run.
+- The PromQL query is URL encodable.
+- The PromQL query takes into account the upstream and open source best practices and norms for Prometheus and PromQL.
+- The PromQL query make reasonable assumptions from the query and the metrics provided as well as their nomenclature.
+- Your final PromQL query has balanced brackets and balanced double quotes (when dealing with label selectors)
+
+Also provide an SRE-like explanation of the query and the metrics it is based on .
+""",
+)
+
+def is_command_available(command: str) -> bool:
+    """Check if a shell command is available in the system PATH.
+    
+    Args:
+        command: Name of the command to check
+        
+    Returns:
+        bool: True if command exists, False otherwise
+    """
+    return which(command) is not None
+
 @retrieval_agent.tool
 def get_namespaces(ctx: RunContext[str]) -> str:
     """Get the list of namespaces in the cluster."""
+    if not is_command_available("oc"):
+        return "Error: 'oc' command not found in PATH"
+    
     output = subprocess.run(
-        [pre_path + "oc", "get", "namespaces"], capture_output=True, timeout=2
+        ["oc", "get", "namespaces"], capture_output=True, timeout=2
     )
     logger.debug(output.stdout)
     return output.stdout
@@ -169,9 +218,12 @@ def get_object_cluster_wide_list(ctx: RunContext[str], kind: str) -> str:
     Returns:
         str: the list of objects in the cluster
     """
+    if not is_command_available("oc"):
+        return "Error: 'oc' command not found in PATH"
+
     logger.info(f"provided kind: {kind}")
     output = subprocess.run(
-        [pre_path + "oc", "get", kind, "-A", "-o", "name"],
+        ["oc", "get", kind, "-A", "-o", "name"],
         capture_output=True,
         timeout=2,
     )
@@ -190,8 +242,11 @@ def get_object_namespace_list(ctx: RunContext[str], kind: str, namespace: str) -
     Returns:
         str: the list of objects in the namespace
     """    
+    if not is_command_available("oc"):
+        return "Error: 'oc' command not found in PATH"
+
     output = subprocess.run(
-        [pre_path + "oc", "get", kind, "-n", namespace, "-o", "name"],
+        ["oc", "get", kind, "-n", namespace, "-o", "name"],
         capture_output=True,
         timeout=2,
     )
@@ -203,9 +258,12 @@ async def get_nonrunning_pods(ctx: RunContext[str]) -> str:
     pod that is not running is not necessarily broken. You should check the pod
     status to determine why it is not running.
     """
+    if not is_command_available("oc"):
+        return "Error: 'oc' command not found in PATH"
+
     output = subprocess.run(
         [
-            pre_path + "oc",
+            "oc",
             "get",
             "pods",
             "-A",
@@ -233,8 +291,11 @@ def get_object_details(ctx: RunContext[str], namespace: str, kind: str, name: st
     Returns:
         str: the YAML text of the object
     """
+    if not is_command_available("oc"):
+        return "Error: 'oc' command not found in PATH"
+
     output = subprocess.run(
-        [pre_path + "oc", "get", kind, "-n", namespace, name, "-o", "yaml"],
+        ["oc", "get", kind, "-n", namespace, name, "-o", "yaml"],
         capture_output=True,
         timeout=2,
     )
@@ -246,9 +307,11 @@ def get_pod_list(ctx: RunContext[str], namespace: str) -> str:
     Args:
         namespace: the namespace to get the pod list from
     """
+    if not is_command_available("oc"):
+        return "Error: 'oc' command not found in PATH"
 
     output = subprocess.run(
-        [pre_path + "oc", "get", "pods", "-n", namespace, "-o", "name"],
+        ["oc", "get", "pods", "-n", namespace, "-o", "name"],
         capture_output=True,
         timeout=2,
     )
@@ -269,8 +332,10 @@ async def get_pod_status(ctx: RunContext[str], namespace: str, pod: str) -> str:
     Returns:
         string: the YAML status block for the object
     """
+    if not is_command_available("oc") or not is_command_available("yq"):
+        return "Error: Required commands ('oc' and/or 'yq') not found in PATH"
 
-    output = subprocess.run(f"{pre_path}oc get pod -n {namespace} {pod} -o jsonpath='{{.status}}' | yq -p json -o yaml",
+    output = subprocess.run(f"oc get pod -n {namespace} {pod} -o jsonpath='{{.status}}' | yq -p json -o yaml",
         shell=True,
         capture_output=True,
         timeout=2,
@@ -292,18 +357,20 @@ async def get_object_health(ctx: RunContext[str], kind: str, name: str, **kwargs
     Returns:
       str: text describing the health of the object
     """
+    if not is_command_available("kube-health"):
+        return "Error: 'kube-health' command not found in PATH"
 
     namespace = kwargs.get('namespace', None)
 
     logger.info(f"get_object_health: {namespace} {kind}/{name}")
     if namespace is None:
-        output = subprocess.run(f"{pre_path}kube-health -H {kind}/{name}",
+        output = subprocess.run(f"kube-health -H {kind}/{name}",
                                 shell=True,
                                 capture_output=True,
                                 timeout=2
                                 )
     else:
-        output = subprocess.run(f"{pre_path}kube-health -n {namespace} -H {kind}/{name}",
+        output = subprocess.run(f"kube-health -n {namespace} -H {kind}/{name}",
                                 shell=True,
                                 capture_output=True,
                                 timeout=2
@@ -315,6 +382,37 @@ async def get_object_health(ctx: RunContext[str], kind: str, name: str, **kwargs
         return "Error: The object you are looking for does not exist"
     else:
         return output.stdout
+    
+@metrics_agent.tool
+async def get_existing_metrics(ctx: RunContext[str], original_query: str) -> list[str] | None:
+    """
+    Get a list of metrics that are relevant to the query.
+
+    Args:
+        original_query: the question to get an relevant metrics for, from the in-cluster Prometheus instance
+
+    Returns:
+        list[str] | None: a list of metrics with all their label name and values, that are relevant to the query,
+                         or None if an error occurs
+    """
+    url = "http://localhost:8081/similar_metrics"
+    params = {
+        "prompt": original_query,
+        "topk": 10
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            print(data[0]["series"])
+            return data[0]["series"]
+    except httpx.RequestError as e:
+        print(f"An error occurred while requesting: {e}")
+    except httpx.HTTPStatusError as e:
+        print(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
+    
 
 @routing_agent.system_prompt
 @retrieval_agent.system_prompt
