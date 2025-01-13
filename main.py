@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+import argparse
 
 from dataclasses import dataclass
 from devtools import pprint
@@ -383,6 +384,14 @@ async def get_object_health(ctx: RunContext[str], kind: str, name: str, **kwargs
     else:
         return output.stdout
     
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='OpenShift/Kubernetes Assistant')
+    parser.add_argument('query', help='The query to process')
+    parser.add_argument('--metrics-endpoint', 
+                       help='Endpoint for the metrics service. If not set, metrics functionality will be disabled')
+    return parser.parse_args()
+
 @metrics_agent.tool
 async def get_existing_metrics(ctx: RunContext[str], original_query: str) -> list[str] | None:
     """
@@ -395,7 +404,11 @@ async def get_existing_metrics(ctx: RunContext[str], original_query: str) -> lis
         list[str] | None: a list of metrics with all their label name and values, that are relevant to the query,
                          or None if an error occurs
     """
-    url = "http://localhost:8081/similar_metrics"
+    args = parse_args()
+    if not args.metrics_endpoint:
+        return None
+        
+    url = f"{args.metrics_endpoint}/similar_metrics"
     params = {
         "prompt": original_query,
         "topk": 10
@@ -419,7 +432,8 @@ async def get_existing_metrics(ctx: RunContext[str], original_query: str) -> lis
 def add_extras() -> str:
     return agent_extras
 
-result = routing_agent.run_sync(sys.argv[1])
-print(result.data)
-
-pprint(result.usage())
+if __name__ == "__main__":
+    args = parse_args()
+    result = routing_agent.run_sync(args.query)
+    print(result.data)
+    pprint(result.usage())
